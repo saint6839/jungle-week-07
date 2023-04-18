@@ -154,35 +154,29 @@ void build_http_header(char *http_header, char *hostname, char *path, int port,
 /* 요청된 uri로부터 hostname, path, port를 parsing */
 void parse_uri(char *uri, char *hostname, char *path, int *port)
 {
-  *port = 8080; /* port 번호 입력 없더라도 8080 webserver로 redirecting */
+  /* default webserver host, port */
+  strcpy(hostname, "localhost");
+  *port = 8080;
+  
+  /* http:// 이후의 host:port/path parsing */
   char *pos = strstr(uri, "//");
   pos = pos != NULL ? pos + 2 : uri;
 
+  /* host: 이후의 port/path parsing*/
   char *pos2 = strstr(pos, ":");
 
-  // chrome, safari 등 외부 브라우저 접속시
-  strcpy(hostname, "localhost");
-
+  /* port 번호를 포함하여 요청했다면  */
   if (pos2 != NULL)
   {
     *pos2 = '\0';
-    sscanf(pos, "%s", hostname);
-    sscanf(pos2 + 1, "%d%s", port, path);
+    sscanf(pos2 + 1, "%d%s", port, path); // 숫자는 port에 이후 문자열은 path에 저장
   }
-  else
+  else /* port 번호가 없이 요청 왔다면 */
   {
     pos2 = strstr(pos, "/");
-    if (pos2 != NULL)
+    if (pos2 != NULL) // path를 통해 특정 자원에 대한 요청이 있을 경우
     {
-      *pos2 = '\0';
-
-      sscanf(pos, "%s", hostname);
-      *pos2 = '/';
-      sscanf(pos2, "%s", path);
-    }
-    else
-    {
-      sscanf(pos, "%s", hostname);
+      sscanf(pos2, "%s", path); // pos2 위치의 문자열을 path에 저장함
     }
   }
   return;
