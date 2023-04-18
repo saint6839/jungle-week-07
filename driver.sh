@@ -5,7 +5,7 @@
 #     behaves like a concurrent caching proxy. 
 #
 #     David O'Hallaron, Carnegie Mellon University
-#     updated: 2/8/2016
+#     updated: 12/09/2013
 # 
 #     usage: ./driver.sh
 # 
@@ -211,7 +211,7 @@ echo "*** Basic ***"
 tiny_port=$(free_port)
 echo "Starting tiny on ${tiny_port}"
 cd ./tiny
-./tiny ${tiny_port}   &> /dev/null  &
+./tiny ${tiny_port} &> /dev/null &
 tiny_pid=$!
 cd ${HOME_DIR}
 
@@ -221,7 +221,7 @@ wait_for_port_use "${tiny_port}"
 # Run the proxy
 proxy_port=$(free_port)
 echo "Starting proxy on ${proxy_port}"
-./proxy ${proxy_port}  &> /dev/null &
+./proxy ${proxy_port} &> /dev/null &
 proxy_pid=$!
 
 # Wait for the proxy to start in earnest
@@ -248,7 +248,7 @@ do
 
     # Compare the two files
     echo "   Comparing the two files"
-    diff -q ${PROXY_DIR}/${file} ${NOPROXY_DIR}/${file} &> /dev/null
+    diff -q ${PROXY_DIR}/${file} ${NOPROXY_DIR}/${file} # &> /dev/null
     if [ $? -eq 0 ]; then
         numSucceeded=`expr ${numSucceeded} + 1`
         echo "   Success: Files are identical."
@@ -265,8 +265,7 @@ wait $proxy_pid 2> /dev/null
 
 basicScore=`expr ${MAX_BASIC} \* ${numSucceeded} / ${numRun}`
 
-echo "basicScore: $basicScore/${MAX_BASIC}"
-
+echo "Basic: $basicScore / ${MAX_BASIC}"
 
 ######
 # Concurrency
@@ -319,7 +318,7 @@ download_proxy $PROXY_DIR ${FETCH_FILE} "http://localhost:${tiny_port}/${FETCH_F
 
 # See if the proxy fetch succeeded
 echo "Checking whether the proxy fetch succeeded"
-diff -q ${PROXY_DIR}/${FETCH_FILE} ${NOPROXY_DIR}/${FETCH_FILE} &> /dev/null
+diff -q ${PROXY_DIR}/${FETCH_FILE} ${NOPROXY_DIR}/${FETCH_FILE} # &> /dev/null
 if [ $? -eq 0 ]; then
     concurrencyScore=${MAX_CONCURRENCY}
     echo "Success: Was able to fetch tiny/${FETCH_FILE} from the proxy."
@@ -337,7 +336,7 @@ wait $proxy_pid 2> /dev/null
 kill $nop_pid 2> /dev/null
 wait $nop_pid 2> /dev/null
 
-echo "concurrencyScore: $concurrencyScore/${MAX_CONCURRENCY}"
+echo "Concurrency: $concurrencyScore / ${MAX_CONCURRENCY}"
 
 #####
 # Caching
@@ -384,7 +383,7 @@ download_proxy $NOPROXY_DIR ${FETCH_FILE} "http://localhost:${tiny_port}/${FETCH
 
 # See if the proxy fetch succeeded by comparing it with the original
 # file in the tiny directory
-diff -q ./tiny/${FETCH_FILE} ${NOPROXY_DIR}/${FETCH_FILE}  &> /dev/null
+diff -q ./tiny/${FETCH_FILE} ${NOPROXY_DIR}/${FETCH_FILE} # &> /dev/null
 if [ $? -eq 0 ]; then
     cacheScore=${MAX_CACHE}
     echo "Success: Was able to fetch tiny/${FETCH_FILE} from the cache."
@@ -398,12 +397,15 @@ echo "Killing proxy"
 kill $proxy_pid 2> /dev/null
 wait $proxy_pid 2> /dev/null
 
-echo "cacheScore: $cacheScore/${MAX_CACHE}"
+echo "Cache: $cacheScore / ${MAX_CACHE}"
 
 # Emit the total score
 totalScore=`expr ${basicScore} + ${cacheScore} + ${concurrencyScore}`
 maxScore=`expr ${MAX_BASIC} + ${MAX_CACHE} + ${MAX_CONCURRENCY}`
 echo ""
-echo "totalScore: ${totalScore}/${maxScore}"
-exit
+echo "totalScore = ${totalScore} / ${maxScore}"
 
+echo ""
+echo "{ \"scores\": {\"Basic\":${basicScore}, \"Concurrency\":${concurrencyScore}, \"Caching\":${cacheScore}}, \"scoreboard\": [${totalScore}, ${basicScore}, ${concurrencyScore}, ${cacheScore}]}"
+
+exit
