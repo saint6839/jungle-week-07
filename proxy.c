@@ -2,6 +2,9 @@
 
 #include "csapp.h"
 
+#define WEBSERVER_HOST "localhost"
+#define WEBSERVER_PORT 8080
+
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
@@ -27,6 +30,14 @@ void read_requesthdrs(rio_t *rp);
 void build_http_header(char *http_header, char *hostname, char *path, int port, rio_t *client_rio);
 int connect_webserver(char *hostname, int port);
 void thread_function(void *arg);
+
+// cache function
+void cache_init();
+int cache_find(char *url);
+void cache_uri(char *uri, char *buf);
+
+void readerPre(int i);
+void readerAfter(int i);
 
 int main(int argc, char **argv)
 {
@@ -59,11 +70,11 @@ int main(int argc, char **argv)
 void thread_function(void *arg)
 {
   pthread_detach(pthread_self());
+
   int connfd = *((int *)arg);
   free(arg);
   doit(connfd);
   Close(connfd);
-  pthread_exit(NULL);
 }
 
 void doit(int connfd)
@@ -89,22 +100,23 @@ void doit(int connfd)
     printf("501 method not implemented");
     return;
   }
-  parse_uri(uri, hostname, path, &port);                                // hostname, path, port 할당
+  
+  parse_uri(uri, hostname, path, &port);          // hostname, path, port 할당
   web_connfd = connect_webserver(hostname, port); // hostname과 port에 해당하는 file descriptor 생성
   if (web_connfd < 0)
   {
     printf("connection failed\n");
     return;
   }
-  build_http_header(webserver_http_header, hostname, path, port, &rio); // 클라이언트의 요청 헤더를 웹 서버에 전달 하기 위한 헤더 구성
-  Rio_readinitb(&server_rio, web_connfd); // web_connfd 입력 스트림으로 server_rio 초기화
+  build_http_header(webserver_http_header, hostname, path, port, &rio);         // 클라이언트의 요청 헤더를 웹 서버에 전달 하기 위한 헤더 구성
+  Rio_readinitb(&server_rio, web_connfd);                                       // web_connfd 입력 스트림으로 server_rio 초기화
   Rio_writen(web_connfd, webserver_http_header, strlen(webserver_http_header)); // 앞서 구성한 웹 서버 전달용 요청 헤더를 웹 서버와 연결된 file descriptor를 통해 작성(전송)
 
   /* web server로부터 받은 응답에 대한 입력스트림을 버퍼에서 한 줄씩 읽어 client에게 응답 반환*/
   size_t n;
   while ((n = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0)
   {
-    // printf("proxy send to client: %s\n", buf); // 전송 테스트 
+    // printf("proxy send to client: %s\n", buf); // 전송 테스트
     Rio_writen(connfd, buf, n);
   }
   Close(web_connfd);
@@ -155,9 +167,9 @@ void build_http_header(char *http_header, char *hostname, char *path, int port,
 void parse_uri(char *uri, char *hostname, char *path, int *port)
 {
   /* default webserver host, port */
-  strcpy(hostname, "localhost");
-  *port = 8080;
-  
+  strcpy(hostname, WEBSERVER_HOST);
+  *port = WEBSERVER_PORT;
+
   /* http:// 이후의 host:port/path parsing */
   char *pos = strstr(uri, "//");
   pos = pos != NULL ? pos + 2 : uri;
