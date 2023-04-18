@@ -53,12 +53,12 @@ int main(int argc, char **argv)
 
     printf("Accepted connection from (%s, %s)\n", hostname, port);
     pthread_create(&tid, NULL, thread_function, connfd_ptr);
-    pthread_detach(tid);
   }
 }
 
 void thread_function(void *arg)
 {
+  pthread_detach(pthread_self());
   int connfd = *((int *)arg);
   free(arg);
   doit(connfd);
