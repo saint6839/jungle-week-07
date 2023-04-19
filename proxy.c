@@ -25,7 +25,7 @@ static const char *user_agent_header = "User-Agent";
 
 void doit(int connfd);
 void parse_uri(char *uri, char *hostname, char *path, int *port);
-void build_http_header(char *http_header, char *hostname, char *path, int port, rio_t *client_rio);
+void build_http_header(char *http_header, char *hostname, char *path, rio_t *client_rio);
 int connect_webserver(char *hostname, int port, char *http_header);
 void *thread_function(void *arg);
 
@@ -43,7 +43,7 @@ typedef struct
   int eviction_priority; // LRU 알고리즘에 의한 소거 우선순위. 숫자가 작을수록 소거에 대한 우선 순위가 높아짐
   int is_empty;          // 이 블럭에 캐시 정보가 들었는지 empty인지 아닌지 체크
 
-  int reader_count; // reader 수
+  int reader_count; // cache block에 접근중인 reader 수
   sem_t wmutex;     // cache block 쓰기 lock 여부
   sem_t rdcntmutex; // cache block 읽기 lock 여부
 } cache_block;
@@ -128,15 +128,17 @@ void doit(int connfd)
   int cache_index;
   if ((cache_index = cache_find(uri_copy)) != -1)
   {
-    get_cache_lock(cache_index); // 캐시 뮤텍스를 풀어줌 (열어줌 0->1)
+    get_cache_lock(cache_index); // cache block lock 획득
     // 캐시에서 찾은 값을 connfd에 쓰고, 캐시에서 그 값을 바로 보내게 됨
-    Rio_writen(connfd, cache.cache_blocks[cache_index].cache_obj, strlen(cache.cache_blocks[cache_index].cache_obj));
-    put_cache_lock(cache_index); // 닫아줌 1->0 doit 끝
+    cache.cache_blocks[cache_index].eviction_priority = CACHE_SIZE; // 가장 최근 읽혔으므로, 소거 우선 순위 가장 낮게
+    update_cache_eviction_priority(cache_index); // 나머지 cache block 소거 우선 순위 증가
+    Rio_writen(connfd, cache.cache_blocks[cache_index].cache_obj, strlen(cache.cache_blocks[cache_index].cache_obj)); // 클라이언트에게 캐싱 데이터 응답
+    put_cache_lock(cache_index); // cache block lock 반환
     return;
   }
 
-  parse_uri(uri, hostname, path, &port);                                // uri 로부터 hostname, path, port 파싱하여 변수에 할당
-  build_http_header(webserver_http_header, hostname, path, port, &rio); // hostname, path, port와 클라이언트 요청을 기반으로 웹 서버에 전송할 요청 헤더 재구성
+  parse_uri(uri, hostname, path, &port);                          // uri 로부터 hostname, path, port 파싱하여 변수에 할당
+  build_http_header(webserver_http_header, hostname, path, &rio); // hostname, path, port와 클라이언트 요청을 기반으로 웹 서버에 전송할 요청 헤더 재구성
 
   web_connfd = connect_webserver(hostname, port, webserver_http_header); // 소켓 생성, 웹 서버와 연결
   if (web_connfd < 0)
@@ -170,7 +172,7 @@ void doit(int connfd)
     cache_uri(uri_copy, response_buf);
 }
 
-void build_http_header(char *http_header, char *hostname, char *path, int port,
+void build_http_header(char *http_header, char *hostname, char *path,
                        rio_t *client_rio)
 {
   char buf[MAXLINE], request_line[MAXLINE], other_hdr[MAXLINE],
@@ -327,7 +329,7 @@ int cache_eviction()
   return minindex;
 }
 
-void cache_eviction_priority(int index)
+void update_cache_eviction_priority(int index)
 {
   for (int i = 0; i < CACHE_SIZE; i++)
   {
@@ -354,7 +356,7 @@ void cache_uri(char *uri, char *response_buf)
   strcpy(cache.cache_blocks[index].cache_uri, uri);          // 클라이언트의 요청 uri를 캐시 블록에 저장
   cache.cache_blocks[index].is_empty = 0;                    // 캐시 블록 할당 되었으므로 0으로 변경
   cache.cache_blocks[index].eviction_priority = CACHE_SIZE;  // 가장 최근 캐싱 되었으므로, 가장 큰 값 부여
-  cache_eviction_priority(index);                            // 기존 나머지 캐시 블록들의 eviction_priority 값을 낮추어서 eviction 우선 순위를 높임
+  update_cache_eviction_priority(index);                     // 기존 나머지 캐시 블록들의 eviction_priority 값을 낮추어서 eviction 우선 순위를 높임
 
   V(&cache.cache_blocks[index].wmutex); // cache block 쓰기 lock 반환
 }
