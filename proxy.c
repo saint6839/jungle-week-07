@@ -4,16 +4,21 @@
 #define WEBSERVER_HOST "localhost"
 #define WEBSERVER_PORT 8080
 
+/* cache */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 #define CACHE_SIZE 10
+
+/* thread pool */
+#define NTHREADS 10
+#define MAXQUEUE 100
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr =
     "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 "
     "Firefox/10.0.3\r\n";
 static const char *request_line_hdr_format = "GET %s HTTP/1.0\r\n";
-static const char *endof_hdr = "\r\n";
+static const char *end_of_hdr = "\r\n";
 static const char *host_hdr_format = "Host: %s\r\n";
 static const char *conn_hdr = "Connection: close\r\n";
 static const char *prox_hdr = "Proxy-Connection: close\r\n";
@@ -23,11 +28,11 @@ static const char *connection_header = "Connection";
 static const char *proxy_connection_header = "Proxy-Connection";
 static const char *user_agent_header = "User-Agent";
 
+void *worker_thread(void *arg);
 void doit(int connfd);
 void parse_uri(char *uri, char *hostname, char *path, int *port);
 void build_http_header(char *http_header, char *hostname, char *path, rio_t *client_rio);
 int connect_webserver(char *hostname, int port, char *http_header);
-void *thread_function(void *arg);
 
 /* caching function */
 void cache_init();
@@ -53,51 +58,102 @@ typedef struct
   cache_block cache_blocks[CACHE_SIZE];
 } Cache;
 
+/* cache 전역 변수 */
 Cache cache;
+
+/* worker thread 에게 넘길 인자 구조체 */
+typedef struct
+{
+  int connfd;
+  struct sockaddr_storage clientaddr;
+  socklen_t clientlen;
+} thread_args;
+
+/* thread pool 전역 변수 */
+pthread_t thread_pool[NTHREADS];                           // worker thread 수
+thread_args queue[MAXQUEUE];                               // worker thread 에게 넘길 인자 배열
+int queue_head = 0;                                        // 큐에서 제거할 위치
+int queue_tail = 0;                                        // 큐에서 삽입할 위치
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;   // 큐 독점 액세스 보장
+pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER; // 큐에 작업이 있고, worker thread에서 작업을 처리할 수 있을때 worker thread에게 알리는 변수
+pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;  // 큐에 여유 공간이 있어서, 작업을 더 받을 수 있음을 알림
 
 int main(int argc, char **argv)
 {
-  int listenfd, *connfd_ptr;
-  socklen_t clientlen;
+  int listenfd;
   char hostname[MAXLINE], port[MAXLINE];
-  pthread_t tid;
   struct sockaddr_storage clientaddr;
+  socklen_t clientlen;
 
   cache_init();
 
   if (argc != 2)
   {
-    fprintf(stderr, "usage: %s <port> \n", argv[0]);
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
     exit(1);
   }
-  // 프로세스가 닫히거나 끊어진 파이프에 쓰기 요청을 할 경우 발생하는 오류(SIGPIPE)를 무시하고 서버를 계속 동작시킬 수 있음
+
+  // 프로세스가 닫히거나 끊어진 파이프에 쓰기 요청을 할 경우 발생하는 오류(SIGPIPE)를 무시하고 서버를 계속 동작시킬 수 있도록 처리
   Signal(SIGPIPE, SIG_IGN);
 
   listenfd = Open_listenfd(argv[1]);
 
-  int connfd;
+  /* thread pool 초기화 */
+  for (int i = 0; i < NTHREADS; i++)
+  {
+    Pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
+  }
 
   while (1)
   {
     clientlen = sizeof(clientaddr);
-    connfd_ptr = (int *)malloc(sizeof(int));
-    *connfd_ptr = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+    int connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
     printf("Accepted connection from (%s %s).\n", hostname, port);
 
-    Pthread_create(&tid, NULL, thread_function, connfd_ptr);
+    pthread_mutex_lock(&queue_mutex); // connection에 대한 작업을 큐에 쓰기 위해서 큐에 대한 access lock 획득
+
+    /* 큐가 가득 찼을 경우 worker thread를 queue_not_full 신호를 보내기 전까지 wait 시킴 */
+    while ((queue_tail + 1) % MAXQUEUE == queue_head)
+    {
+      pthread_cond_wait(&queue_not_full, &queue_mutex);
+    }
+
+    /* worker thread가 처리할 인자를 포함한 구조체 초기화 */
+    queue[queue_tail].connfd = connfd;
+    queue[queue_tail].clientaddr = clientaddr;
+    queue[queue_tail].clientlen = clientlen;
+    queue_tail = (queue_tail + 1) % MAXQUEUE; // 큐의 다음 작업 삽입 위치
+
+    pthread_cond_signal(&queue_not_empty);
+    pthread_mutex_unlock(&queue_mutex);
   }
+
   return 0;
 }
 
-void *thread_function(void *arg)
+void *worker_thread(void *arg)
 {
-  Pthread_detach(Pthread_self());
+  while (1)
+  {
+    pthread_mutex_lock(&queue_mutex); // 동시성 제어 하기 위해 진입시 lock 획득
 
-  int connfd = *((int *)arg);
-  free(arg);
-  doit(connfd);
-  Close(connfd);
+    /* 작업 queue가 비어있는 동안 */
+    while (queue_head == queue_tail)
+    {
+      /* queue_not_empty 신호를 받을때까지, queue_mutex를 이용해서 큐에 대한 접근을 lock하고 대기 */
+      pthread_cond_wait(&queue_not_empty, &queue_mutex);
+    }
+
+    thread_args t_args = queue[queue_head];   // head 위치에서 다음 작업 연결 세부 정보 가져옴
+    queue_head = (queue_head + 1) % MAXQUEUE; // head 포인터를 증가 시켜 다음 uri작업 대상을 가리킴
+
+    pthread_cond_signal(&queue_not_full); // 큐에 공간이 있음을 queue_not_full 조건 변수에 신호 보냄
+    pthread_mutex_unlock(&queue_mutex);   // 큐의 동시성과 관련된 로직 종료되었으므로 lock 반환
+
+    doit(t_args.connfd);
+    Close(t_args.connfd);
+  }
 }
 
 void doit(int connfd)
@@ -113,7 +169,7 @@ void doit(int connfd)
   Rio_readlineb(&rio, buf, MAXLINE);
   printf("Request headers: \n");
   printf("%s", buf);
-  sscanf(buf, "%s %s %s", method, uri, version); // read the client reqeust line
+  sscanf(buf, "%s %s %s", method, uri, version); // 클라이언트 reqeust line 정보 파싱 {method} {path or uri} {http version}
 
   if (strcasecmp(method, "GET"))
   {
@@ -121,22 +177,21 @@ void doit(int connfd)
     return;
   }
 
-  char uri_copy[100];
-  strcpy(uri_copy, uri);
-
   /* 요청 uri 주소가 캐싱되어 있는 주소 인지 */
   int cache_index;
-  if ((cache_index = cache_find(uri_copy)) != -1)
+  if ((cache_index = cache_find(uri)) != -1)
   {
     get_cache_lock(cache_index); // cache block lock 획득
     // 캐시에서 찾은 값을 connfd에 쓰고, 캐시에서 그 값을 바로 보내게 됨
-    cache.cache_blocks[cache_index].eviction_priority = CACHE_SIZE; // 가장 최근 읽혔으므로, 소거 우선 순위 가장 낮게
-    update_cache_eviction_priority(cache_index); // 나머지 cache block 소거 우선 순위 증가
+    cache.cache_blocks[cache_index].eviction_priority = CACHE_SIZE;                                                   // 가장 최근 읽혔으므로, 소거 우선 순위 가장 낮게
+    update_cache_eviction_priority(cache_index);                                                                      // 나머지 cache block 소거 우선 순위 증가
     Rio_writen(connfd, cache.cache_blocks[cache_index].cache_obj, strlen(cache.cache_blocks[cache_index].cache_obj)); // 클라이언트에게 캐싱 데이터 응답
-    put_cache_lock(cache_index); // cache block lock 반환
+    put_cache_lock(cache_index);                                                                                      // cache block lock 반환
     return;
   }
 
+  char uri_copy[1000];
+  strcpy(uri_copy, uri);
   parse_uri(uri, hostname, path, &port);                          // uri 로부터 hostname, path, port 파싱하여 변수에 할당
   build_http_header(webserver_http_header, hostname, path, &rio); // hostname, path, port와 클라이언트 요청을 기반으로 웹 서버에 전송할 요청 헤더 재구성
 
@@ -183,7 +238,7 @@ void build_http_header(char *http_header, char *hostname, char *path,
   /* 클라이언트 입력 스트림 버퍼를 한 줄씩 읽어서 HTTP header를 만듦 */
   while (Rio_readlineb(client_rio, buf, MAXLINE) > 0)
   {
-    if (strcmp(buf, endof_hdr) == 0)
+    if (strcmp(buf, end_of_hdr) == 0)
       break;
 
     /* 대소문자 여부 상관 없이 비교 if true -> return 0 */
@@ -204,7 +259,7 @@ void build_http_header(char *http_header, char *hostname, char *path,
   if (strlen(host_hdr) == 0)
     sprintf(host_hdr, host_hdr_format, hostname);
   sprintf(http_header, "%s%s%s%s%s%s%s", request_line, host_hdr, conn_hdr,
-          prox_hdr, user_agent_hdr, other_hdr, endof_hdr);
+          prox_hdr, user_agent_hdr, other_hdr, end_of_hdr);
   printf("%s\n", http_header);
 
   return;
