@@ -31,6 +31,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "usage: %s <port>\n", argv[0]);
     exit(1);
   }
+  // 프로세스가 닫히거나 끊어진 파이프에 쓰기 요청을 할 경우 발생하는 오류(SIGPIPE)를 무시하고 서버를 계속 동작시킬 수 있음
+  Signal(SIGPIPE, SIG_IGN);
 
   listenfd = Open_listenfd(argv[1]);
   while (1)

@@ -40,10 +40,10 @@ typedef struct
 {
   char cache_obj[MAX_OBJECT_SIZE];
   char cache_uri[MAXLINE];
-  int eviction_priority;      // LRU 알고리즘에 의한 소거 우선순위. 숫자가 작을수록 소거에 대한 우선 순위가 높아짐
-  int is_empty; // 이 블럭에 캐시 정보가 들었는지 empty인지 아닌지 체크
+  int eviction_priority; // LRU 알고리즘에 의한 소거 우선순위. 숫자가 작을수록 소거에 대한 우선 순위가 높아짐
+  int is_empty;          // 이 블럭에 캐시 정보가 들었는지 empty인지 아닌지 체크
 
-  int reader_count;   // reader 수
+  int reader_count; // reader 수
   sem_t wmutex;     // cache block 쓰기 lock 여부
   sem_t rdcntmutex; // cache block 읽기 lock 여부
 } cache_block;
@@ -71,7 +71,7 @@ int main(int argc, char **argv)
     exit(1);
   }
   // 프로세스가 닫히거나 끊어진 파이프에 쓰기 요청을 할 경우 발생하는 오류(SIGPIPE)를 무시하고 서버를 계속 동작시킬 수 있음
-  Signal(SIGPIPE, SIG_IGN); 
+  Signal(SIGPIPE, SIG_IGN);
 
   listenfd = Open_listenfd(argv[1]);
 
@@ -85,14 +85,14 @@ int main(int argc, char **argv)
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
     printf("Accepted connection from (%s %s).\n", hostname, port);
 
-    pthread_create(&tid, NULL, thread_function, connfd_ptr);
+    Pthread_create(&tid, NULL, thread_function, connfd_ptr);
   }
   return 0;
 }
 
 void *thread_function(void *arg)
 {
-  pthread_detach(pthread_self());
+  Pthread_detach(Pthread_self());
 
   int connfd = *((int *)arg);
   free(arg);
@@ -121,8 +121,8 @@ void doit(int connfd)
     return;
   }
 
-  char uri_copy[100];    
-  strcpy(uri_copy, uri); 
+  char uri_copy[100];
+  strcpy(uri_copy, uri);
 
   /* 요청 uri 주소가 캐싱되어 있는 주소 인지 */
   int cache_index;
@@ -135,7 +135,7 @@ void doit(int connfd)
     return;
   }
 
-  parse_uri(uri, hostname, path, &port); // uri 로부터 hostname, path, port 파싱하여 변수에 할당
+  parse_uri(uri, hostname, path, &port);                                // uri 로부터 hostname, path, port 파싱하여 변수에 할당
   build_http_header(webserver_http_header, hostname, path, port, &rio); // hostname, path, port와 클라이언트 요청을 기반으로 웹 서버에 전송할 요청 헤더 재구성
 
   web_connfd = connect_webserver(hostname, port, webserver_http_header); // 소켓 생성, 웹 서버와 연결
@@ -150,7 +150,7 @@ void doit(int connfd)
 
   char response_buf[MAX_OBJECT_SIZE];
   int size_buf = 0;
-  size_t n; 
+  size_t n;
 
   /* 웹 서버 응답을 한 줄씩 읽어서 클라이언트에게 전달 */
   while ((n = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0)
@@ -159,14 +159,14 @@ void doit(int connfd)
     size_buf += n;
     /* proxy거쳐서 서버에서 response오는데, 그 응답을 저장하고 클라이언트에 보냄 */
     if (size_buf < MAX_OBJECT_SIZE) // response_buf에 제한 두지 않고 계속 쓰다보면 buffer overflow 발생
-      strcat(response_buf, buf);       
+      strcat(response_buf, buf);
     Rio_writen(connfd, buf, n);
   }
 
   Close(web_connfd);
 
   /* 저장된 response_buf의 크기가 cache block에 저장될 수 있는 최대 크기보다 작을때만 캐싱 */
-  if (size_buf < MAX_OBJECT_SIZE) 
+  if (size_buf < MAX_OBJECT_SIZE)
     cache_uri(uri_copy, response_buf);
 }
 
@@ -250,8 +250,8 @@ void cache_init()
 {
   for (int i = 0; i < CACHE_SIZE; i++)
   {
-    cache.cache_blocks[i].eviction_priority = 0;      // 아직 캐싱된 데이터 없으므로 0, 최근에 할당 된 cache block 일 수록 높은 값을 가짐
-    cache.cache_blocks[i].is_empty = 1; // 아직 캐싱된 데이터 없으므로 1
+    cache.cache_blocks[i].eviction_priority = 0; // 아직 캐싱된 데이터 없으므로 0, 최근에 할당 된 cache block 일 수록 높은 값을 가짐
+    cache.cache_blocks[i].is_empty = 1;          // 아직 캐싱된 데이터 없으므로 1
 
     // 두번째 파라미터 1이면 process shared, 0이면 thread shared, 세번째 파라미터 -> 세마포어 초기값 1(액세스 가능)
     Sem_init(&cache.cache_blocks[i].wmutex, 0, 1);     // -> 진입 가능한 자원 1개뿐이므로 binary semaphore
@@ -263,25 +263,25 @@ void cache_init()
 /* cache block 접근 전 cache block access lock을 얻기 위한 함수 */
 void get_cache_lock(int index)
 {
-  P(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
+  P(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 획득
 
   cache.cache_blocks[index].reader_count++;        // read count 증가(조회 하러 들어가므로)
   if (cache.cache_blocks[index].reader_count == 1) // reader_count == 1 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
-    P(&cache.cache_blocks[index].wmutex);        // cache block에 대한 write lock 획득
+    P(&cache.cache_blocks[index].wmutex);          // cache block에 대한 write lock 획득
 
-  V(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 반환
+  V(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 반환
 }
 
 /* cache block 접근 끝난 이후 cache block access lock을 반환하기 위한 함수 */
 void put_cache_lock(int index)
 {
-  P(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
+  P(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 획득
 
   cache.cache_blocks[index].reader_count--;        // read count 감소(조회 끝났으므로)
   if (cache.cache_blocks[index].reader_count == 0) // reader_count == 0 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
-    V(&cache.cache_blocks[index].wmutex);        // cache block에 대한 write lock 획득
+    V(&cache.cache_blocks[index].wmutex);          // cache block에 대한 write lock 획득
 
-  V(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
+  V(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 획득
 }
 
 /* cache 에서 요청 uri와 일치하는 uri를 가지고 있는 cache block을 탐색하여 해당 block의 index 반환 */
@@ -319,7 +319,7 @@ int cache_eviction()
     /* eviction_priority가 현재 최솟값 min 보다 작다면 eviction_priority 값을 갱신 해주면서 최소 cache block 탐색*/
     if (cache.cache_blocks[i].eviction_priority < min)
     {
-      minindex = i;                 // i로 minindex 갱신
+      minindex = i;                                  // i로 minindex 갱신
       min = cache.cache_blocks[i].eviction_priority; // min은 i번째 cache block의 eviction_priority 값으로 갱신
     }
     put_cache_lock(i);
@@ -337,7 +337,7 @@ void cache_eviction_priority(int index)
     P(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 획득
 
     if (cache.cache_blocks[i].is_empty == 0)
-      cache.cache_blocks[i].eviction_priority--;    // 최근 캐싱된 cache block을 제외한 나머지 cache block eviction_priority 값을 감소 시킴
+      cache.cache_blocks[i].eviction_priority--; // 최근 캐싱된 cache block을 제외한 나머지 cache block eviction_priority 값을 감소 시킴
 
     V(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 반환
   }
@@ -353,8 +353,8 @@ void cache_uri(char *uri, char *response_buf)
   strcpy(cache.cache_blocks[index].cache_obj, response_buf); // 웹 서버 응답 값을 캐시 블록에 저장
   strcpy(cache.cache_blocks[index].cache_uri, uri);          // 클라이언트의 요청 uri를 캐시 블록에 저장
   cache.cache_blocks[index].is_empty = 0;                    // 캐시 블록 할당 되었으므로 0으로 변경
-  cache.cache_blocks[index].eviction_priority = CACHE_SIZE;                // 가장 최근 캐싱 되었으므로, 가장 큰 값 부여
-  cache_eviction_priority(index);                                       // 기존 나머지 캐시 블록들의 eviction_priority 값을 낮추어서 eviction 우선 순위를 높임
+  cache.cache_blocks[index].eviction_priority = CACHE_SIZE;  // 가장 최근 캐싱 되었으므로, 가장 큰 값 부여
+  cache_eviction_priority(index);                            // 기존 나머지 캐시 블록들의 eviction_priority 값을 낮추어서 eviction 우선 순위를 높임
 
   V(&cache.cache_blocks[index].wmutex); // cache block 쓰기 lock 반환
 }
