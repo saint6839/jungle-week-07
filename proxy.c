@@ -4,14 +4,9 @@
 #define WEBSERVER_HOST "localhost"
 #define WEBSERVER_PORT 8080
 
-/* cache */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 #define CACHE_SIZE 10
-
-/* thread pool */
-#define NTHREADS 10
-#define MAXQUEUE 100
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr =
@@ -38,8 +33,6 @@ int connect_webserver(char *hostname, int port, char *http_header);
 void cache_init();
 int cache_find(char *uri);
 void cache_uri(char *uri, char *response_buf);
-void get_cache_lock(int index);
-void put_cache_lock(int index);
 
 typedef struct
 {
@@ -47,10 +40,7 @@ typedef struct
   char cache_uri[MAXLINE];
   int eviction_priority; // LRU 알고리즘에 의한 소거 우선순위. 숫자가 작을수록 소거에 대한 우선 순위가 높아짐
   int is_empty;          // 이 블럭에 캐시 정보가 들었는지 empty인지 아닌지 체크
-
-  int reader_count; // cache block에 접근중인 reader 수
   sem_t wmutex;     // cache block 쓰기 lock 여부
-  sem_t rdcntmutex; // cache block 읽기 lock 여부
 } cache_block;
 
 typedef struct
@@ -58,8 +48,10 @@ typedef struct
   cache_block cache_blocks[CACHE_SIZE];
 } Cache;
 
-/* cache 전역 변수 */
 Cache cache;
+
+#define NTHREADS 10
+#define MAXQUEUE 100
 
 /* worker thread 에게 넘길 인자 구조체 */
 typedef struct
@@ -67,11 +59,11 @@ typedef struct
   int connfd;
   struct sockaddr_storage clientaddr;
   socklen_t clientlen;
-} thread_args;
+} thread_arg_t;
 
 /* thread pool 전역 변수 */
 pthread_t thread_pool[NTHREADS];                           // worker thread 수
-thread_args queue[MAXQUEUE];                               // worker thread 에게 넘길 인자 배열
+thread_arg_t queue[MAXQUEUE];                              // worker thread 에게 넘길 인자 배열
 int queue_head = 0;                                        // 큐에서 제거할 위치
 int queue_tail = 0;                                        // 큐에서 삽입할 위치
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;   // 큐 독점 액세스 보장
@@ -125,8 +117,8 @@ int main(int argc, char **argv)
     queue[queue_tail].clientlen = clientlen;
     queue_tail = (queue_tail + 1) % MAXQUEUE; // 큐의 다음 작업 삽입 위치
 
-    pthread_cond_signal(&queue_not_empty);
-    pthread_mutex_unlock(&queue_mutex);
+    pthread_cond_signal(&queue_not_empty); // 큐에 작업 삽입 했으므로 큐에 작업이 있음을 알림
+    pthread_mutex_unlock(&queue_mutex); // 큐에 관련된 작업 마쳤으므로 lock 반환
   }
 
   return 0;
@@ -145,14 +137,14 @@ void *worker_thread(void *arg)
       pthread_cond_wait(&queue_not_empty, &queue_mutex);
     }
 
-    thread_args t_args = queue[queue_head];   // head 위치에서 다음 작업 연결 세부 정보 가져옴
-    queue_head = (queue_head + 1) % MAXQUEUE; // head 포인터를 증가 시켜 다음 uri작업 대상을 가리킴
+    thread_arg_t thread_arg = queue[queue_head]; // head 위치에서 다음 작업 연결 세부 정보 가져옴
+    queue_head = (queue_head + 1) % MAXQUEUE;    // head 포인터를 증가 시켜 다음 uri작업 대상을 가리킴
 
     pthread_cond_signal(&queue_not_full); // 큐에 공간이 있음을 queue_not_full 조건 변수에 신호 보냄
     pthread_mutex_unlock(&queue_mutex);   // 큐의 동시성과 관련된 로직 종료되었으므로 lock 반환
 
-    doit(t_args.connfd);
-    Close(t_args.connfd);
+    doit(thread_arg.connfd);
+    Close(thread_arg.connfd);
   }
 }
 
@@ -181,12 +173,10 @@ void doit(int connfd)
   int cache_index;
   if ((cache_index = cache_find(uri)) != -1)
   {
-    get_cache_lock(cache_index); // cache block lock 획득
     // 캐시에서 찾은 값을 connfd에 쓰고, 캐시에서 그 값을 바로 보내게 됨
     cache.cache_blocks[cache_index].eviction_priority = CACHE_SIZE;                                                   // 가장 최근 읽혔으므로, 소거 우선 순위 가장 낮게
     update_cache_eviction_priority(cache_index);                                                                      // 나머지 cache block 소거 우선 순위 증가
     Rio_writen(connfd, cache.cache_blocks[cache_index].cache_obj, strlen(cache.cache_blocks[cache_index].cache_obj)); // 클라이언트에게 캐싱 데이터 응답
-    put_cache_lock(cache_index);                                                                                      // cache block lock 반환
     return;
   }
 
@@ -312,33 +302,7 @@ void cache_init()
 
     // 두번째 파라미터 1이면 process shared, 0이면 thread shared, 세번째 파라미터 -> 세마포어 초기값 1(액세스 가능)
     Sem_init(&cache.cache_blocks[i].wmutex, 0, 1);     // -> 진입 가능한 자원 1개뿐이므로 binary semaphore
-    Sem_init(&cache.cache_blocks[i].rdcntmutex, 0, 1); // -> 진입 가능한 자원 1개뿐이므로 binary semaphore
-    cache.cache_blocks[i].reader_count = 0;
   }
-}
-
-/* cache block 접근 전 cache block access lock을 얻기 위한 함수 */
-void get_cache_lock(int index)
-{
-  P(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 획득
-
-  cache.cache_blocks[index].reader_count++;        // read count 증가(조회 하러 들어가므로)
-  if (cache.cache_blocks[index].reader_count == 1) // reader_count == 1 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
-    P(&cache.cache_blocks[index].wmutex);          // cache block에 대한 write lock 획득
-
-  V(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 반환
-}
-
-/* cache block 접근 끝난 이후 cache block access lock을 반환하기 위한 함수 */
-void put_cache_lock(int index)
-{
-  P(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 획득
-
-  cache.cache_blocks[index].reader_count--;        // read count 감소(조회 끝났으므로)
-  if (cache.cache_blocks[index].reader_count == 0) // reader_count == 0 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
-    V(&cache.cache_blocks[index].wmutex);          // cache block에 대한 write lock 획득
-
-  V(&cache.cache_blocks[index].rdcntmutex); // reader count 값 변경에 대한 lock 획득
 }
 
 /* cache 에서 요청 uri와 일치하는 uri를 가지고 있는 cache block을 탐색하여 해당 block의 index 반환 */
@@ -347,14 +311,14 @@ int cache_find(char *uri)
   printf("\ncache hit ! ====> %s\n", uri);
   for (int i = 0; i < CACHE_SIZE; i++)
   {
-    get_cache_lock(i);
+    P(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 획득
     /* cache block 이 empty 가 아니고, cache block에 있는 uri이 현재 요청 uri과 일치한다면 cache block의 index 반환 */
     if (strcmp(uri, cache.cache_blocks[i].cache_uri) == 0)
     {
-      put_cache_lock(i);
+      V(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 반환
       return i;
     }
-    put_cache_lock(i);
+    V(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 반환
   }
   return -1;
 }
@@ -366,11 +330,11 @@ int cache_eviction()
   int minindex = 0;
   for (int i = 0; i < CACHE_SIZE; i++)
   {
-    get_cache_lock(i);
+    P(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 획득
     /* cache block empty 라면 해당 block의 index를 반환 */
-    if (cache.cache_blocks[i].is_empty == 1)
+    if (cache.cache_blocks[i].is_empty == 1) // 비어 있는 cache block 있다면, 해당 블록 인덱스 반환
     {
-      put_cache_lock(i);
+      V(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 반환
       return i;
     }
     /* eviction_priority가 현재 최솟값 min 보다 작다면 eviction_priority 값을 갱신 해주면서 최소 cache block 탐색*/
@@ -379,7 +343,7 @@ int cache_eviction()
       minindex = i;                                  // i로 minindex 갱신
       min = cache.cache_blocks[i].eviction_priority; // min은 i번째 cache block의 eviction_priority 값으로 갱신
     }
-    put_cache_lock(i);
+    V(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 반환
   }
   return minindex;
 }
