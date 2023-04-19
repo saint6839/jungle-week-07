@@ -29,29 +29,28 @@ void build_http_header(char *http_header, char *hostname, char *path, int port, 
 int connect_webserver(char *hostname, int port, char *http_header);
 void *thread_function(void *arg);
 
-// cache function
+/* caching function */
 void cache_init();
 int cache_find(char *uri);
 void cache_uri(char *uri, char *response_buf);
-
-void get_cache_lock(int i);
-void put_cache_lock(int i);
+void get_cache_lock(int index);
+void put_cache_lock(int index);
 
 typedef struct
 {
   char cache_obj[MAX_OBJECT_SIZE];
   char cache_uri[MAXLINE];
-  int LRU;      // least recently used 가장 최근에 사용한 것의 우선순위를 뒤로 미움 (캐시에서 삭제할 때)
+  int eviction_priority;      // LRU 알고리즘에 의한 소거 우선순위. 숫자가 작을수록 소거에 대한 우선 순위가 높아짐
   int is_empty; // 이 블럭에 캐시 정보가 들었는지 empty인지 아닌지 체크
 
-  int read_count;   // count of readers
-  sem_t wmutex;     // protects accesses to cache 세마포어 타입. 1: 사용가능, 0: 사용 불가능
-  sem_t rdcntmutex; // protects accesses to read_count
-} cache_block;      // 캐쉬블럭 구조체로 선언
+  int reader_count;   // reader 수
+  sem_t wmutex;     // cache block 쓰기 lock 여부
+  sem_t rdcntmutex; // cache block 읽기 lock 여부
+} cache_block;
 
 typedef struct
 {
-  cache_block cacheobjs[CACHE_SIZE]; // ten cache blocks
+  cache_block cache_blocks[CACHE_SIZE];
 } Cache;
 
 Cache cache;
@@ -71,7 +70,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "usage: %s <port> \n", argv[0]);
     exit(1);
   }
-  Signal(SIGPIPE, SIG_IGN);
+  // 프로세스가 닫히거나 끊어진 파이프에 쓰기 요청을 할 경우 발생하는 오류(SIGPIPE)를 무시하고 서버를 계속 동작시킬 수 있음
+  Signal(SIGPIPE, SIG_IGN); 
 
   listenfd = Open_listenfd(argv[1]);
 
@@ -107,7 +107,6 @@ void doit(int connfd)
   char webserver_http_header[MAXLINE];
   char hostname[MAXLINE], path[MAXLINE];
 
-  // rio: client's rio / server_rio: webserver's rio
   rio_t rio, server_rio;
 
   Rio_readinitb(&rio, connfd);
@@ -131,7 +130,7 @@ void doit(int connfd)
   {
     get_cache_lock(cache_index); // 캐시 뮤텍스를 풀어줌 (열어줌 0->1)
     // 캐시에서 찾은 값을 connfd에 쓰고, 캐시에서 그 값을 바로 보내게 됨
-    Rio_writen(connfd, cache.cacheobjs[cache_index].cache_obj, strlen(cache.cacheobjs[cache_index].cache_obj));
+    Rio_writen(connfd, cache.cache_blocks[cache_index].cache_obj, strlen(cache.cache_blocks[cache_index].cache_obj));
     put_cache_lock(cache_index); // 닫아줌 1->0 doit 끝
     return;
   }
@@ -251,49 +250,49 @@ void cache_init()
 {
   for (int i = 0; i < CACHE_SIZE; i++)
   {
-    cache.cacheobjs[i].LRU = 0;      // 아직 캐싱된 데이터 없으므로 0, 최근에 할당 된 cache block 일 수록 높은 값을 가짐
-    cache.cacheobjs[i].is_empty = 1; // 아직 캐싱된 데이터 없으므로 1
+    cache.cache_blocks[i].eviction_priority = 0;      // 아직 캐싱된 데이터 없으므로 0, 최근에 할당 된 cache block 일 수록 높은 값을 가짐
+    cache.cache_blocks[i].is_empty = 1; // 아직 캐싱된 데이터 없으므로 1
 
     // 두번째 파라미터 1이면 process shared, 0이면 thread shared, 세번째 파라미터 -> 세마포어 초기값 1(액세스 가능)
-    Sem_init(&cache.cacheobjs[i].wmutex, 0, 1);     // -> 진입 가능한 자원 1개뿐이므로 binary semaphore
-    Sem_init(&cache.cacheobjs[i].rdcntmutex, 0, 1); // -> 진입 가능한 자원 1개뿐이므로 binary semaphore
-    cache.cacheobjs[i].read_count = 0;
+    Sem_init(&cache.cache_blocks[i].wmutex, 0, 1);     // -> 진입 가능한 자원 1개뿐이므로 binary semaphore
+    Sem_init(&cache.cache_blocks[i].rdcntmutex, 0, 1); // -> 진입 가능한 자원 1개뿐이므로 binary semaphore
+    cache.cache_blocks[i].reader_count = 0;
   }
 }
 
 /* cache block 접근 전 cache block access lock을 얻기 위한 함수 */
 void get_cache_lock(int index)
 {
-  P(&cache.cacheobjs[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
+  P(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
 
-  cache.cacheobjs[index].read_count++;        // read count 증가(조회 하러 들어가므로)
-  if (cache.cacheobjs[index].read_count == 1) // read_count == 1 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
-    P(&cache.cacheobjs[index].wmutex);        // cache block에 대한 write lock 획득
+  cache.cache_blocks[index].reader_count++;        // read count 증가(조회 하러 들어가므로)
+  if (cache.cache_blocks[index].reader_count == 1) // reader_count == 1 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
+    P(&cache.cache_blocks[index].wmutex);        // cache block에 대한 write lock 획득
 
-  V(&cache.cacheobjs[index].rdcntmutex);      // reader count 값 변경에 대한 lock 반환
+  V(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 반환
 }
 
 /* cache block 접근 끝난 이후 cache block access lock을 반환하기 위한 함수 */
 void put_cache_lock(int index)
 {
-  P(&cache.cacheobjs[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
+  P(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
 
-  cache.cacheobjs[index].read_count--;        // read count 감소(조회 끝났으므로)
-  if (cache.cacheobjs[index].read_count == 0) // read_count == 0 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
-    V(&cache.cacheobjs[index].wmutex);        // cache block에 대한 write lock 획득
+  cache.cache_blocks[index].reader_count--;        // read count 감소(조회 끝났으므로)
+  if (cache.cache_blocks[index].reader_count == 0) // reader_count == 0 -> 현재 읽는 사용자 한명만 캐시 블록에 접근 중
+    V(&cache.cache_blocks[index].wmutex);        // cache block에 대한 write lock 획득
 
-  V(&cache.cacheobjs[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
+  V(&cache.cache_blocks[index].rdcntmutex);      // reader count 값 변경에 대한 lock 획득
 }
 
 /* cache 에서 요청 uri와 일치하는 uri를 가지고 있는 cache block을 탐색하여 해당 block의 index 반환 */
 int cache_find(char *uri)
 {
-  printf("cache hit ! ====> %s", uri);
+  printf("\ncache hit ! ====> %s\n", uri);
   for (int i = 0; i < CACHE_SIZE; i++)
   {
     get_cache_lock(i);
     /* cache block 이 empty 가 아니고, cache block에 있는 uri이 현재 요청 uri과 일치한다면 cache block의 index 반환 */
-    if (strcmp(uri, cache.cacheobjs[i].cache_uri) == 0)
+    if (strcmp(uri, cache.cache_blocks[i].cache_uri) == 0)
     {
       put_cache_lock(i);
       return i;
@@ -303,7 +302,7 @@ int cache_find(char *uri)
   return -1;
 }
 
-/* LRU 알고리즘에 따라 최소 LRU 값을 갖는 cache block의 index 찾아 반환 */
+/* eviction_priority 알고리즘에 따라 최소 eviction_priority 값을 갖는 cache block의 index 찾아 반환 */
 int cache_eviction()
 {
   int min = CACHE_SIZE;
@@ -312,35 +311,35 @@ int cache_eviction()
   {
     get_cache_lock(i);
     /* cache block empty 라면 해당 block의 index를 반환 */
-    if (cache.cacheobjs[i].is_empty == 1)
+    if (cache.cache_blocks[i].is_empty == 1)
     {
       put_cache_lock(i);
       return i;
     }
-    /* LRU가 현재 최솟값 min 보다 작다면 LRU 값을 갱신 해주면서 최소 cache block 탐색*/
-    if (cache.cacheobjs[i].LRU < min)
+    /* eviction_priority가 현재 최솟값 min 보다 작다면 eviction_priority 값을 갱신 해주면서 최소 cache block 탐색*/
+    if (cache.cache_blocks[i].eviction_priority < min)
     {
       minindex = i;                 // i로 minindex 갱신
-      min = cache.cacheobjs[i].LRU; // min은 i번째 cache block의 LRU 값으로 갱신
+      min = cache.cache_blocks[i].eviction_priority; // min은 i번째 cache block의 eviction_priority 값으로 갱신
     }
     put_cache_lock(i);
   }
   return minindex;
 }
 
-void cache_LRU(int index)
+void cache_eviction_priority(int index)
 {
   for (int i = 0; i < CACHE_SIZE; i++)
   {
     if (i == index)
       continue;
 
-    P(&cache.cacheobjs[i].wmutex); // cache block 쓰기 lock 획득
+    P(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 획득
 
-    if (cache.cacheobjs[i].is_empty == 0)
-      cache.cacheobjs[i].LRU--;    // 최근 캐싱된 cache block을 제외한 나머지 cache block LRU 값을 감소 시킴
+    if (cache.cache_blocks[i].is_empty == 0)
+      cache.cache_blocks[i].eviction_priority--;    // 최근 캐싱된 cache block을 제외한 나머지 cache block eviction_priority 값을 감소 시킴
 
-    V(&cache.cacheobjs[i].wmutex); // cache block 쓰기 lock 반환
+    V(&cache.cache_blocks[i].wmutex); // cache block 쓰기 lock 반환
   }
 }
 
@@ -349,13 +348,13 @@ void cache_uri(char *uri, char *response_buf)
 {
   int index = cache_eviction(); // 빈 캐시 블럭을 찾는 첫번째 index
 
-  P(&cache.cacheobjs[index].wmutex); // cache block 쓰기 lock 획득
+  P(&cache.cache_blocks[index].wmutex); // cache block 쓰기 lock 획득
 
-  strcpy(cache.cacheobjs[index].cache_obj, response_buf); // 웹 서버 응답 값을 캐시 블록에 저장
-  strcpy(cache.cacheobjs[index].cache_uri, uri);          // 클라이언트의 요청 uri를 캐시 블록에 저장
-  cache.cacheobjs[index].is_empty = 0;                    // 캐시 블록 할당 되었으므로 0으로 변경
-  cache.cacheobjs[index].LRU = CACHE_SIZE;                // 가장 최근 캐싱 되었으므로, 가장 큰 값 부여
-  cache_LRU(index);                                       // 기존 나머지 캐시 블록들의 LRU 값을 낮추어서 eviction 우선 순위를 높임
+  strcpy(cache.cache_blocks[index].cache_obj, response_buf); // 웹 서버 응답 값을 캐시 블록에 저장
+  strcpy(cache.cache_blocks[index].cache_uri, uri);          // 클라이언트의 요청 uri를 캐시 블록에 저장
+  cache.cache_blocks[index].is_empty = 0;                    // 캐시 블록 할당 되었으므로 0으로 변경
+  cache.cache_blocks[index].eviction_priority = CACHE_SIZE;                // 가장 최근 캐싱 되었으므로, 가장 큰 값 부여
+  cache_eviction_priority(index);                                       // 기존 나머지 캐시 블록들의 eviction_priority 값을 낮추어서 eviction 우선 순위를 높임
 
-  V(&cache.cacheobjs[index].wmutex); // cache block 쓰기 lock 반환
+  V(&cache.cache_blocks[index].wmutex); // cache block 쓰기 lock 반환
 }
